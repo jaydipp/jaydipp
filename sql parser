@@ -1,0 +1,70 @@
+import re
+import pandas as pd
+from collections import defaultdict
+
+def extract_tables_and_columns(sql_query):
+    table_aliases = {}
+    table_columns = defaultdict(lambda: defaultdict(set))
+    
+    # Normalize query to handle case variations
+    sql_query = sql_query.strip()
+    
+    # Regex to find table aliases in FROM and JOIN clauses
+    table_pattern = re.findall(r'\bFROM\s+((?:\w+\.){0,2}\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
+    table_pattern += re.findall(r'\bJOIN\s+((?:\w+\.){0,2}\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
+    
+    for table, alias in table_pattern:
+        if alias:
+            table_aliases[alias] = table  # Map alias to actual table
+        table_aliases[table] = table  # Store actual table as well
+    
+    # Reverse alias lookup for JOIN conditions
+    alias_to_table = {alias: table for alias, table in table_aliases.items() if alias}
+    
+    # Regex to find selected columns with table aliases
+    column_pattern = re.search(r'\bSELECT\s+([\w\s,.*]+?)\s+\bFROM\b', sql_query, re.IGNORECASE)
+    
+    if column_pattern:
+        columns = column_pattern.group(1).split(',')
+        for col in columns:
+            col = col.strip()
+            if '.' in col:
+                alias, column = col.rsplit('.', 1)
+                table = table_aliases.get(alias, alias)  # Resolve alias to actual table
+                if table in table_aliases:  # Ensure we're not adding aliases
+                    table = table_aliases[table]
+                db_table = table.rsplit('.', 1) if '.' in table else (None, table)
+                table_columns[db_table[0]][db_table[1]].add(column)
+    
+    # Extract columns from ON conditions in JOINs
+    join_conditions = re.findall(r'ON\s+(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)', sql_query, re.IGNORECASE)
+    for alias1, col1, alias2, col2 in join_conditions:
+        table1 = table_aliases.get(alias1, alias1)  # Resolve alias to actual table
+        table2 = table_aliases.get(alias2, alias2)
+        if table1 in table_aliases:
+            table1 = table_aliases[table1]
+        if table2 in table_aliases:
+            table2 = table_aliases[table2]
+        db_table1 = table1.rsplit('.', 1) if '.' in table1 else (None, table1)
+        db_table2 = table2.rsplit('.', 1) if '.' in table2 else (None, table2)
+        table_columns[db_table1[0]][db_table1[1]].add(col1)
+        table_columns[db_table2[0]][db_table2[1]].add(col2)
+    
+    return table_columns
+
+# Example usage
+sql_query = """
+SELECT A.LOAN_NUMBER, B.LM_TEMPLATE_NAME, c.total_payment FROM MORTGMGR.MSP_LOAN_D A LEFT JOIN MORTGMGR.MSP_LOSS_MITIGATION_D B ON A.LOAN_NUMBER = B.LOAN_NUMBER
+left join mortgmgr.msp_finance_d c on a.loan_number = c.loan_number
+"""
+sql_query = sql_query.upper()
+
+tables_with_columns = extract_tables_and_columns(sql_query)
+
+data = []
+for db, tables in tables_with_columns.items():
+    for table, columns in tables.items():
+        data.append({"Database": db, "Table": table, "Columns": ', '.join(columns)})
+
+df = pd.DataFrame(data)
+print(df)
