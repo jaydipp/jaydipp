@@ -1,0 +1,38 @@
+import re
+import pandas as pd
+
+# Function to extract database and table names (without columns)
+def extract_databases_and_tables(sql_query):
+    table_info = []
+
+    # Normalize query to handle case variations
+    sql_query = sql_query.strip().lower()  # Convert SQL to lowercase
+
+    # Regex to find table aliases in FROM and JOIN clauses (including database names)
+    table_pattern = re.findall(r'\bfrom\s+((?:\w+\.){0,2}\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
+    table_pattern += re.findall(r'\bjoin\s+((?:\w+\.){0,2}\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
+
+    # Loop through the matches and extract database and table information
+    for table, alias in table_pattern:
+        # Split database and table (if database is present)
+        if '.' in table:
+            db, tbl = table.split('.', 1)
+        else:
+            db = None
+            tbl = table
+        
+        # Append to the table_info list
+        table_info.append({"Database Name": db, "Table Name": tbl})
+    
+    # Convert the list of dictionaries to a DataFrame
+    df = pd.DataFrame(table_info)
+
+    return df
+
+# Example usage
+sql_query = """
+SELECT a.id, name, address FROM profile.users a 
+LEFT JOIN profile.address b ON a.id = b.id
+"""
+df = extract_databases_and_tables(sql_query)
+print(df)
