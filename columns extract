@@ -13,6 +13,28 @@ column_lookup = {
 df_columns = pd.DataFrame(column_lookup)
 df_columns["Column Name"] = df_columns["Column Name"].str.lower()  # Normalize case
 
+
+def extract_columns_from_case(case_expr, table_aliases):
+    """ Extracts columns from a nested CASE statement """
+    case_columns = set()
+    case_expr = case_expr.lower()
+
+    # Find all column references (table.column or just column)
+    columns_in_case = re.findall(r'(\w+)\.(\w+)|\b(\w+)\b', case_expr)
+    
+    for match in columns_in_case:
+        table_alias, column, single_col = match
+
+        if column:  # Format: table.column
+            table = table_aliases.get(table_alias, table_alias)
+            db_table = table.rsplit('.', 1) if '.' in table else (None, table)
+            case_columns.add((db_table[0], db_table[1], column))
+        elif single_col:  # Standalone column
+            case_columns.add((None, None, single_col))
+
+    return case_columns
+
+
 def extract_tables_and_columns(sql_query, df_columns):
     table_aliases = {}
     table_columns = defaultdict(lambda: defaultdict(set))
@@ -20,12 +42,23 @@ def extract_tables_and_columns(sql_query, df_columns):
     # Normalize whitespace
     sql_query = re.sub(r'\s+', ' ', sql_query.strip())
 
-    # Handle CTEs (Common Table Expressions)
+    # **1. Extract CTEs (WITH statements)**
     cte_pattern = re.findall(r'with\s+(\w+)\s+as\s*\((.*?)\)\s*', sql_query, re.IGNORECASE)
     for cte_name, cte_query in cte_pattern:
         table_aliases[cte_name] = cte_name  # Store CTE as a table alias
+        sql_query = sql_query.replace(f'WITH {cte_name} AS ({cte_query})', '')  # Remove CTEs from main query
 
-    # Extract table aliases from FROM, JOIN, and CROSS JOIN clauses
+    # **2. Extract nested subqueries iteratively**
+    subquery_stack = []
+    subquery_pattern = re.finditer(r'\((select .*?)\)', sql_query, re.IGNORECASE)
+
+    for match in subquery_pattern:
+        subquery = match.group(1)
+        subquery_name = f"subquery_{len(subquery_stack)}"
+        subquery_stack.append((subquery_name, subquery))
+        sql_query = sql_query.replace(match.group(0), subquery_name)  # Replace subquery with alias
+
+    # **3. Extract table aliases from FROM, JOIN, and CROSS JOIN clauses**
     table_pattern = re.findall(r'\b(from|join|cross join)\s+((?:\w+\.){0,2}\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
     for _, table, alias in table_pattern:
         if alias:
@@ -35,7 +68,7 @@ def extract_tables_and_columns(sql_query, df_columns):
     # Reverse alias lookup for JOIN conditions
     alias_to_table = {alias: table for alias, table in table_aliases.items() if alias}
 
-    # Extract selected columns
+    # **4. Extract selected columns**
     column_pattern = re.search(r'\bselect\s+(.*?)\s+\bfrom\b', sql_query, re.IGNORECASE)
     if column_pattern:
         columns = column_pattern.group(1).split(',')
@@ -53,7 +86,7 @@ def extract_tables_and_columns(sql_query, df_columns):
                     table = matched_row.iloc[0]["Table Name"]
                     table_columns[db][table].add(col)
 
-    # Extract columns from WHERE, HAVING, and ORDER BY clauses
+    # **5. Extract columns from WHERE, HAVING, ORDER BY**
     clause_pattern = re.findall(r'\b(where|having|order by)\s+(.*?)(?=\bgroup by|\border by|\bhaving|\blimit|$)', sql_query, re.IGNORECASE)
     for _, clause in clause_pattern:
         clause_columns = re.findall(r'(\w+)\.(\w+)', clause)
@@ -62,7 +95,7 @@ def extract_tables_and_columns(sql_query, df_columns):
             db_table = table.rsplit('.', 1) if '.' in table else (None, table)
             table_columns[db_table[0]][db_table[1]].add(column)
 
-    # Extract columns from ON conditions in JOINs
+    # **6. Extract columns from JOIN conditions**
     join_conditions = re.findall(r'on\s+(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)', sql_query, re.IGNORECASE)
     for alias1, col1, alias2, col2 in join_conditions:
         table1 = table_aliases.get(alias1, alias1)
@@ -72,36 +105,23 @@ def extract_tables_and_columns(sql_query, df_columns):
         table_columns[db_table1[0]][db_table1[1]].add(col1)
         table_columns[db_table2[0]][db_table2[1]].add(col2)
 
-    # Extract columns from CASE statements (excluding derived column names)
-    case_pattern = re.findall(r'case(.*?)end', sql_query, re.IGNORECASE)
+    # **7. Extract columns from Nested CASE statements**
+    case_pattern = re.findall(r'case(.*?)end', sql_query, re.IGNORECASE | re.DOTALL)
     case_columns = set()
     for case_expr in case_pattern:
-        columns_in_case = re.findall(r'(\w+)\.(\w+)', case_expr)
-        for table_alias, column in columns_in_case:
-            table = table_aliases.get(table_alias, table_alias)
-            db_table = table.rsplit('.', 1) if '.' in table else (None, table)
-            case_columns.add((db_table[0], db_table[1], column))
-
-        case_when_else_columns = re.findall(r'then\s+(\w+\.\w+|\w+)\s*|else\s+(\w+\.\w+|\w+)', case_expr, re.IGNORECASE)
-        for match in case_when_else_columns:
-            for column in match:
-                if '.' in column:
-                    table_alias, column_name = column.rsplit('.', 1)
-                    table = table_aliases.get(table_alias, table_alias)
-                    db_table = table.rsplit('.', 1) if '.' in table else (None, table)
-                    case_columns.add((db_table[0], db_table[1], column_name))
-                else:
-                    matched_row = df_columns[df_columns["Column Name"].str.lower() == column]
-                    if not matched_row.empty:
-                        db = matched_row.iloc[0]["Database Name"]
-                        table = matched_row.iloc[0]["Table Name"]
-                        case_columns.add((db, table, column))
+        case_columns.update(extract_columns_from_case(case_expr, table_aliases))
 
     # Include case statement columns
     for db, table, column in case_columns:
         table_columns[db][table].add(column)
 
-    # Prepare the output
+    # **8. Process nested subqueries iteratively**
+    for subquery_name, subquery in subquery_stack:
+        subquery_df = extract_tables_and_columns(subquery, df_columns)
+        for _, row in subquery_df.iterrows():
+            table_columns[row["Database Name"]][row["Table Name"]].add(row["Column Name"])
+
+    # **9. Prepare the output**
     data = []
     for db, tables in table_columns.items():
         for table, columns in tables.items():
@@ -114,20 +134,20 @@ def extract_tables_and_columns(sql_query, df_columns):
 
     return pd.DataFrame(data)
 
-# Example usage
+# **Example Query with Nested CASE Statements:**
 sql_query = """
-WITH temp_table AS (
-    SELECT id, name FROM profile.users WHERE id > 10
-)
-SELECT a.id, 
-       CASE 
-           WHEN b.status = 'active' THEN b.address
-           ELSE null
-       END AS status_column,
-       a.name, b.address
+SELECT 
+    a.id, 
+    CASE 
+        WHEN b.status = 'active' THEN 
+            CASE 
+                WHEN a.name IS NOT NULL THEN b.address 
+                ELSE 'Unknown' 
+            END
+        ELSE 'Inactive'
+    END AS status_column
 FROM profile.users a 
 LEFT JOIN profile.addresses b ON a.id = b.id
-CROSS JOIN temp_table c
 WHERE b.status = 'active'
 ORDER BY a.name
 """
