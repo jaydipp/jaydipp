@@ -11,96 +11,107 @@ column_lookup = {
 
 # Create DataFrame from the dictionary
 df_columns = pd.DataFrame(column_lookup)
+df_columns["Column Name"] = df_columns["Column Name"].str.lower()  # Normalize column names
 
-# Normalize the column names to lowercase for consistent matching
-df_columns["Column Name"] = df_columns["Column Name"].str.lower()
+def normalize_sql(sql_query):
+    """Normalize SQL query by removing excessive whitespace."""
+    return re.sub(r'\s+', ' ', sql_query.strip())
 
-# Function to extract databases, tables, and columns, including CASE handling
+def extract_subqueries(sql_query):
+    """Extracts subqueries recursively from the given SQL query."""
+    subquery_pattern = re.findall(r'\(\s*select(.*?)\)', sql_query, re.IGNORECASE)
+    return subquery_pattern
+
 def extract_tables_and_columns(sql_query, df_columns):
+    """Extract tables and columns from SQL query, including nested subqueries."""
     table_aliases = {}
     table_columns = defaultdict(lambda: defaultdict(set))
-    
-    # Normalize whitespace by replacing multiple spaces and newlines with a single space
-    sql_query = re.sub(r'\s+', ' ', sql_query.strip())
-    
-    # Regex to find table aliases in FROM and JOIN clauses
-    table_pattern = re.findall(r'\bfrom\s+((?:\w+\.){0,2}\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
-    table_pattern += re.findall(r'\bjoin\s+((?:\w+\.){0,2}\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
+
+    sql_query = normalize_sql(sql_query)  # Preprocess SQL query
+
+    # Extract and process subqueries first
+    subqueries = extract_subqueries(sql_query)
+    for subquery in subqueries:
+        extract_tables_and_columns(f"SELECT {subquery}", df_columns)  # Recursively extract
+
+    # Extract table aliases from FROM and JOIN clauses
+    table_pattern = re.findall(r'\bfrom\s+((?:\w+\.)?\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
+    table_pattern += re.findall(r'\bjoin\s+((?:\w+\.)?\w+)\s*(\w+)?', sql_query, re.IGNORECASE)
 
     for table, alias in table_pattern:
         if alias:
-            table_aliases[alias] = table  # Map alias to actual table
-        table_aliases[table] = table  # Store actual table as well
+            table_aliases[alias] = table
+        table_aliases[table] = table
 
-    # Reverse alias lookup for JOIN conditions
     alias_to_table = {alias: table for alias, table in table_aliases.items() if alias}
 
-    # Regex to find selected columns with table aliases
+    # Extract selected columns
     column_pattern = re.search(r'\bselect\s+(.*?)\s+\bfrom\b', sql_query, re.IGNORECASE)
-
-    columns = []
     if column_pattern:
         columns = column_pattern.group(1).split(',')
         for col in columns:
             col = col.strip()
             if '.' in col:
                 alias, column = col.rsplit('.', 1)
-                table = table_aliases.get(alias, alias)  # Resolve alias to actual table
+                table = table_aliases.get(alias, alias)
                 db_table = table.rsplit('.', 1) if '.' in table else (None, table)
                 table_columns[db_table[0]][db_table[1]].add(column)
             else:
-                # Handle columns without table aliases (search the provided dictionary for the table)
-                matched_row = df_columns[df_columns["Column Name"].str.lower() == col]  # Case-insensitive lookup
+                matched_row = df_columns[df_columns["Column Name"].str.lower() == col]
                 if not matched_row.empty:
                     db = matched_row.iloc[0]["Database Name"]
                     table = matched_row.iloc[0]["Table Name"]
                     table_columns[db][table].add(col)
 
-    # Extract columns from ON conditions in JOINs
+    # Extract columns from JOIN conditions
     join_conditions = re.findall(r'on\s+(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)', sql_query, re.IGNORECASE)
     for alias1, col1, alias2, col2 in join_conditions:
-        table1 = table_aliases.get(alias1, alias1)  # Resolve alias to actual table
+        table1 = table_aliases.get(alias1, alias1)
         table2 = table_aliases.get(alias2, alias2)
         db_table1 = table1.rsplit('.', 1) if '.' in table1 else (None, table1)
         db_table2 = table2.rsplit('.', 1) if '.' in table2 else (None, table2)
         table_columns[db_table1[0]][db_table1[1]].add(col1)
         table_columns[db_table2[0]][db_table2[1]].add(col2)
 
-    # Extract columns used inside CASE statements (only columns used in conditions, not derived columns)
+    # Extract columns from WHERE clause
+    where_pattern = re.findall(r'where\s+(.*?)(?:group\s+by|order\s+by|limit|$)', sql_query, re.IGNORECASE)
+    if where_pattern:
+        where_clause = where_pattern[0]
+        where_columns = re.findall(r'(\w+)\.(\w+)', where_clause)  # Extract table.column format
+        for table_alias, column in where_columns:
+            table = table_aliases.get(table_alias, table_alias)
+            db_table = table.rsplit('.', 1) if '.' in table else (None, table)
+            table_columns[db_table[0]][db_table[1]].add(column)
+
+    # Extract columns from CASE statements
     case_pattern = re.findall(r'case(.*?)end', sql_query, re.IGNORECASE)
     case_columns = set()
-
     for case_expr in case_pattern:
-        # Extract columns used in WHEN conditions (ignore THEN/ELSE columns)
-        # The regex captures columns from both `table.column` and `column`
         columns_in_case = re.findall(r'(\w+)\.(\w+)', case_expr)
         for table_alias, column in columns_in_case:
-            table = table_aliases.get(table_alias, table_alias)  # Resolve alias to actual table
+            table = table_aliases.get(table_alias, table_alias)
             db_table = table.rsplit('.', 1) if '.' in table else (None, table)
-            case_columns.add((db_table[0], db_table[1], column))  # Add (db, table, column) tuple
+            case_columns.add((db_table[0], db_table[1], column))
 
-        # Now capture columns in THEN/ELSE parts (as long as they refer to actual columns, not static values)
         case_when_else_columns = re.findall(r'then\s+(\w+\.\w+|\w+)\s*|else\s+(\w+\.\w+|\w+)', case_expr, re.IGNORECASE)
         for match in case_when_else_columns:
             for column in match:
                 if '.' in column:
                     table_alias, column_name = column.rsplit('.', 1)
-                    table = table_aliases.get(table_alias, table_alias)  # Resolve alias to actual table
+                    table = table_aliases.get(table_alias, table_alias)
                     db_table = table.rsplit('.', 1) if '.' in table else (None, table)
-                    case_columns.add((db_table[0], db_table[1], column_name))  # Add (db, table, column) tuple
+                    case_columns.add((db_table[0], db_table[1], column_name))
                 else:
-                    # For columns without table alias (standalone columns)
-                    matched_row = df_columns[df_columns["Column Name"].str.lower() == column]  # Case-insensitive lookup
+                    matched_row = df_columns[df_columns["Column Name"].str.lower() == column]
                     if not matched_row.empty:
                         db = matched_row.iloc[0]["Database Name"]
                         table = matched_row.iloc[0]["Table Name"]
-                        case_columns.add((db, table, column))  # Add (db, table, column) tuple
+                        case_columns.add((db, table, column))
 
-    # Include the case columns into the table_columns dictionary
     for db, table, column in case_columns:
         table_columns[db][table].add(column)
 
-    # Prepare the data for the final DataFrame
+    # Prepare DataFrame
     data = []
     for db, tables in table_columns.items():
         for table, columns in tables.items():
@@ -113,17 +124,20 @@ def extract_tables_and_columns(sql_query, df_columns):
 
     return pd.DataFrame(data)
 
-# Example usage
-sql_query = """
+# Example SQL with nested subqueries and WHERE clause
+sql_query = r"""
 SELECT a.id, 
+       (SELECT max(status) FROM profile.addresses WHERE user_id = a.id) AS max_status,
        CASE 
            WHEN b.status = 'active' THEN b.address
            ELSE null
        END AS status_column,
-       name
+       a.name
 FROM profile.users a 
 LEFT JOIN profile.addresses b ON a.id = b.id
+WHERE b.status = 'active'
 """
+
 df = extract_tables_and_columns(sql_query, df_columns)
 df = df[df['Database Name'].isin(list(df_columns['Database Name']))]
 print(df)
