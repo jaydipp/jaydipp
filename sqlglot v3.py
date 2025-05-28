@@ -2,107 +2,107 @@ import sqlglot
 from sqlglot import parse_one, expressions as exp
 import pandas as pd
 
-# Sample SQL with CTE and subquery
+# Sample SQL query with CTEs and subqueries
 sql = """
-WITH recent_loans AS (
-    SELECT loan_number, process_dt 
-    FROM ip.mg_loan_table 
-    WHERE process_dt > '2023-01-01'
+WITH cte1 AS (
+    SELECT loan_number, process_dt FROM a.loan
 ),
-latest_letters AS (
-    SELECT loan_number, MAX(letter_date) AS last_letter_date
-    FROM ip.mg_letter_table
-    GROUP BY loan_number
+cte2 AS (
+    SELECT * FROM cte1 WHERE process_dt > '2023-01-01'
 )
-SELECT 
-    a.loan_number, 
-    a.process_dt,
-    b.last_letter_date,
-    CASE 
-        WHEN b.last_letter_date > a.process_dt THEN 'Y' 
-        ELSE 'N' 
-    END AS is_recent
-FROM recent_loans a
-LEFT JOIN latest_letters b ON a.loan_number = b.loan_number
-WHERE a.process_dt IS NOT NULL
+SELECT x.loan_number, x.process_dt
+FROM (
+    SELECT * FROM cte2
+) x
 """
 
 # Reference column metadata
-df_columns = pd.DataFrame({
-    "Database Name": ["ip"] * 6,
-    "Schema Name":   ["mg"] * 6,
-    "Table Name":    ["loan_table", "loan_table", "loan_table", "letter_table", "letter_table", "letter_table"],
-    "Column Name":   ["loan_number", "process_dt", "amount", "loan_number", "letter_date", "letter_id"]
-}).astype(str).apply(lambda col: col.str.strip().str.lower())
+column_df = pd.DataFrame({
+    "Database Name": ["ip", "ip", "ip", "ip"],
+    "Schema Name":   ["a", "a", "a", "b"],
+    "Table Name":    ["loan", "loan", "loan", "another"],
+    "Column Name":   ["loan_number", "process_dt", "abc", "process_dt"]
+})
 
-# Helper: normalize column lookup
-col_lookup = df_columns.groupby("Column Name")[["Database Name", "Schema Name", "Table Name"]].apply(lambda x: x.to_records(index=False).tolist()).to_dict()
+column_df = column_df.astype(str).apply(lambda col: col.str.strip().str.lower())
 
-# Parse SQL
 parsed = parse_one(sql)
 
-# Recursive function to walk through expressions and extract columns
-def extract_columns(expr, alias_map=None, cte_map=None):
-    if alias_map is None:
-        alias_map = {}
-    if cte_map is None:
-        cte_map = {}
+alias_map = {}  # alias -> (db, schema, table)
+cte_map = {}    # cte name -> parsed expression
 
-    records = set()
+# Collect all CTEs
+for cte in parsed.find_all(exp.CTE):
+    cte_name = cte.alias_or_name
+    cte_map[cte_name] = cte.this
 
-    def update_alias_map(expr):
-        local_map = {}
+# Track alias from tables and subqueries
+
+def process_table_expr(expr, alias_override=None):
+    if isinstance(expr, exp.Subquery):
+        alias = alias_override or expr.alias_or_name
         for table_expr in expr.find_all(exp.Table):
-            alias = table_expr.alias_or_name or table_expr.name
             db_expr = table_expr.args.get("db")
             schema_expr = table_expr.args.get("catalog")
             db = db_expr.name.lower() if db_expr else None
             schema = schema_expr.name.lower() if schema_expr else None
             table = table_expr.name.lower()
+            if alias:
+                alias_map[alias] = (db, schema, table)
+    elif isinstance(expr, exp.Table):
+        alias = alias_override or expr.alias_or_name
+        db_expr = expr.args.get("db")
+        schema_expr = expr.args.get("catalog")
+        db = db_expr.name.lower() if db_expr else None
+        schema = schema_expr.name.lower() if schema_expr else None
+        table = expr.name.lower()
 
-            local_map[alias] = (db, schema, table)
-        return local_map
+        # Try to infer DB/schema from column_df if missing
+        if not db or not schema:
+            matches = column_df[column_df["Table Name"] == table]
+            if not db and not matches.empty and matches["Database Name"].nunique() == 1:
+                db = matches.iloc[0]["Database Name"]
+            if not schema and not matches.empty and matches["Schema Name"].nunique() == 1:
+                schema = matches.iloc[0]["Schema Name"]
 
-    if isinstance(expr, exp.With):
-        for cte in expr.ctes:
-            cte_map[cte.alias_or_name] = cte.this
-        expr = expr.this
+        if alias:
+            alias_map[alias] = (db, schema, table)
 
-    alias_map.update(update_alias_map(expr))
+# Handle FROM clauses, subqueries, and main tables
+for node in parsed.find_all(exp.From):
+    for expr in node.args.get("expressions", []):
+        process_table_expr(expr)
 
-    for node in expr.walk():
-        if isinstance(node, exp.Subquery):
-            # Recurse into subquery
-            records |= extract_columns(node.unnest(), alias_map.copy(), cte_map)
-        elif isinstance(node, exp.CTE):
-            continue
-        elif isinstance(node, exp.Column):
-            col = node.name.lower()
-            tbl_alias = node.table
+# Also process CTE subqueries
+for name, cte_expr in cte_map.items():
+    for node in cte_expr.find_all(exp.From):
+        for expr in node.args.get("expressions", []):
+            process_table_expr(expr)
 
-            if tbl_alias:
-                if tbl_alias in alias_map:
-                    db, schema, table = alias_map[tbl_alias]
-                    if db and table:
-                        records.add((db, schema, table, col))
-            else:
-                # Unqualified column
-                matches = col_lookup.get(col)
-                if matches and len(matches) == 1:
-                    db, schema, table = matches[0]
-                    records.add((db, schema, table, col))
+# Extract columns
+records = set()
 
-    # Handle CTEs
-    for alias, cte_expr in cte_map.items():
-        records |= extract_columns(cte_expr, alias_map.copy(), cte_map)
+for node in parsed.walk():
+    if isinstance(node, exp.Column):
+        col = node.name.strip().lower()
+        alias = node.table
 
-    return records
-
-# Run extraction
-columns = extract_columns(parsed)
+        if alias and alias in alias_map:
+            db, schema, table = alias_map[alias]
+            records.add((db, schema, table, col))
+        else:
+            # Try to resolve unqualified columns
+            matches = column_df[column_df["Column Name"] == col]
+            if not matches.empty:
+                for _, row in matches.iterrows():
+                    records.add((
+                        row["Database Name"],
+                        row["Schema Name"],
+                        row["Table Name"],
+                        row["Column Name"]
+                    ))
 
 # Final DataFrame
-df_result = pd.DataFrame(columns, columns=["Database", "Schema", "Table", "Column"])
-df_result = df_result.drop_duplicates().sort_values(by=["Database", "Schema", "Table", "Column"]).reset_index(drop=True)
-
+df_result = pd.DataFrame(sorted(records), columns=["Database", "Schema", "Table", "Column"])
+df_result = df_result.drop_duplicates()
 print(df_result)
