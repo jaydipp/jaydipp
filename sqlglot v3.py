@@ -2,84 +2,86 @@ import sqlglot
 from sqlglot import parse_one, expressions as exp
 import pandas as pd
 
-# Sample SQL query with CTEs and subqueries
+# Sample SQL query
 sql = """
-WITH cte1 AS (
-    SELECT loan_number, process_dt FROM a.loan
-),
-cte2 AS (
-    SELECT * FROM cte1 WHERE process_dt > '2023-01-01'
-)
-SELECT x.loan_number, x.process_dt
+SELECT user_id, user_name 
 FROM (
-    SELECT * FROM cte2
-) x
+    SELECT p_date, user_id 
+    FROM mg.users
+) uid 
+LEFT JOIN mg.user_info h 
+    ON h.unumber = uid.user_id
 """
 
 # Reference column metadata
-column_df = pd.DataFrame({
-    "Database Name": ["ip", "ip", "ip", "ip"],
-    "Schema Name":   ["a", "a", "a", "b"],
-    "Table Name":    ["loan", "loan", "loan", "another"],
-    "Column Name":   ["loan_number", "process_dt", "abc", "process_dt"]
+df_columns = pd.DataFrame({
+    "Database Name": ["ip"] * 8,
+    "Schema Name": ["mg"] * 5 + ["mg"] * 3,
+    "Table Name": ["users"] * 3 + ["user_info"] * 3 + ["users", "user_info"],
+    "Column Name": [
+        "p_date", "user_id", "user_name",
+        "unumber", "user_name", "user_id",
+        "p_date", "user_name"
+    ]
 })
 
-column_df = column_df.astype(str).apply(lambda col: col.str.strip().str.lower())
+# Normalize for matching
+df_columns = df_columns.astype(str).apply(lambda col: col.str.strip().str.lower())
 
+# Parse SQL
 parsed = parse_one(sql)
 
-alias_map = {}  # alias -> (db, schema, table)
-cte_map = {}    # cte name -> parsed expression
+# Helper: Build alias map and handle subqueries
+alias_map = {}
+cte_map = {}
 
-# Collect all CTEs
-for cte in parsed.find_all(exp.CTE):
-    cte_name = cte.alias_or_name
-    cte_map[cte_name] = cte.this
 
-# Track alias from tables and subqueries
-
-def process_table_expr(expr, alias_override=None):
+def process_from_expression(expr, parent_alias=None):
     if isinstance(expr, exp.Subquery):
-        alias = alias_override or expr.alias_or_name
-        for table_expr in expr.find_all(exp.Table):
-            db_expr = table_expr.args.get("db")
-            schema_expr = table_expr.args.get("catalog")
-            db = db_expr.name.lower() if db_expr else None
-            schema = schema_expr.name.lower() if schema_expr else None
-            table = table_expr.name.lower()
-            if alias:
-                alias_map[alias] = (db, schema, table)
-    elif isinstance(expr, exp.Table):
-        alias = alias_override or expr.alias_or_name
-        db_expr = expr.args.get("db")
-        schema_expr = expr.args.get("catalog")
+        alias = expr.alias_or_name
+        sub_select = expr.unnest()
+        visible_cols = []
+        for proj in sub_select.expressions:
+            if isinstance(proj, exp.Alias):
+                visible_cols.append((proj.alias, proj.this))
+            elif isinstance(proj, exp.Column):
+                visible_cols.append((proj.name, proj))
+        for col_name, col_expr in visible_cols:
+            source_table = col_expr.table
+            if source_table in alias_map:
+                db, schema, table = alias_map[source_table]
+                alias_map.setdefault(alias, []).append((col_name, db, schema, table))
+        return
+
+    if isinstance(expr, exp.Table):
+        alias = expr.alias_or_name
+        db_expr = expr.args.get("catalog")
+        schema_expr = expr.args.get("db")
         db = db_expr.name.lower() if db_expr else None
         schema = schema_expr.name.lower() if schema_expr else None
         table = expr.name.lower()
 
-        # Try to infer DB/schema from column_df if missing
-        if not db or not schema:
-            matches = column_df[column_df["Table Name"] == table]
-            if not db and not matches.empty and matches["Database Name"].nunique() == 1:
-                db = matches.iloc[0]["Database Name"]
-            if not schema and not matches.empty and matches["Schema Name"].nunique() == 1:
-                schema = matches.iloc[0]["Schema Name"]
+        # Infer DB and Schema from df_columns if missing
+        if db is None or schema is None:
+            matches = df_columns[df_columns["Table Name"] == table]
+            if not matches.empty:
+                if db is None and matches["Database Name"].nunique() == 1:
+                    db = matches.iloc[0]["Database Name"]
+                if schema is None and matches["Schema Name"].nunique() == 1:
+                    schema = matches.iloc[0]["Schema Name"]
 
-        if alias:
-            alias_map[alias] = (db, schema, table)
+        alias_map[alias] = (db, schema, table)
 
-# Handle FROM clauses, subqueries, and main tables
-for node in parsed.find_all(exp.From):
-    for expr in node.args.get("expressions", []):
-        process_table_expr(expr)
 
-# Also process CTE subqueries
-for name, cte_expr in cte_map.items():
-    for node in cte_expr.find_all(exp.From):
-        for expr in node.args.get("expressions", []):
-            process_table_expr(expr)
+# Process FROM and JOIN clauses
+for from_expr in parsed.find_all(exp.From):
+    for source in from_expr.args.get("expressions", []):
+        process_from_expression(source)
 
-# Extract columns
+for join_expr in parsed.find_all(exp.Join):
+    process_from_expression(join_expr.this)
+
+# Extract column references
 records = set()
 
 for node in parsed.walk():
@@ -88,11 +90,17 @@ for node in parsed.walk():
         alias = node.table
 
         if alias and alias in alias_map:
-            db, schema, table = alias_map[alias]
-            records.add((db, schema, table, col))
-        else:
-            # Try to resolve unqualified columns
-            matches = column_df[column_df["Column Name"] == col]
+            entry = alias_map[alias]
+            if isinstance(entry, list):  # Subquery
+                for c, db, schema, table in entry:
+                    if c == col:
+                        records.add((db, schema, table, col))
+                        break
+            else:
+                db, schema, table = entry
+                records.add((db, schema, table, col))
+        elif not alias:  # Unqualified column
+            matches = df_columns[df_columns["Column Name"] == col]
             if not matches.empty:
                 for _, row in matches.iterrows():
                     records.add((
@@ -102,7 +110,6 @@ for node in parsed.walk():
                         row["Column Name"]
                     ))
 
-# Final DataFrame
+# Final deduplicated DataFrame
 df_result = pd.DataFrame(sorted(records), columns=["Database", "Schema", "Table", "Column"])
-df_result = df_result.drop_duplicates()
 print(df_result)
