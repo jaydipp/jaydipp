@@ -1,135 +1,141 @@
 import sqlglot
-from sqlglot import parse_one, expressions as exp
+from sqlglot import parse_one, exp
 import pandas as pd
 
-# Sample SQL query
 sql = """
-WITH recent_users AS (
-    SELECT user_id, user_name FROM mg.users
+WITH a AS (
+    SELECT h.hi, h.hj, h.hk FROM mg.hope h
 ),
-extended_users AS (
-    SELECT * FROM recent_users
+b AS (
+    SELECT p.pr, p.pz, a.hi FROM mg.pro p JOIN a ON a.hi = p.hi
 )
-SELECT ru.*, h.user_name 
-FROM extended_users ru
-JOIN mg.user_info h ON h.unumber = ru.user_id
-UNION
-SELECT * FROM mg.archive_users
+SELECT * 
+FROM (
+    SELECT b.*, ROW_NUMBER() OVER (PARTITION BY b.hi ORDER BY b.pr) as rn 
+    FROM b
+) final
 """
 
-# Reference column metadata
+# Reference metadata (used for disambiguating unqualified columns)
 df_columns = pd.DataFrame({
-    "Database Name": ["ip"] * 9,
-    "Schema Name": ["mg"] * 9,
-    "Table Name": ["users", "users", "user_info", "user_info", "user_info", "archive_users", "archive_users", "users", "archive_users"],
-    "Column Name": [
-        "user_id", "user_name", "unumber",
-        "user_name", "user_id", "user_id",
-        "user_name", "user_name", "user_id"
-    ]
-})
+    "Database Name": ["mg"] * 5 + ["mg"] * 3,
+    "Schema Name": ["mg"] * 8,
+    "Table Name": ["hope"] * 3 + ["pro"] * 3 + ["hope", "pro"],
+    "Column Name": ["hi", "hj", "hk", "pr", "pz", "hi", "hj", "pr"]
+}).astype(str).apply(lambda col: col.str.strip().str.lower())
 
-# Normalize metadata for matching
-df_columns = df_columns.astype(str).apply(lambda col: col.str.strip().str.lower())
-
-# Parse SQL
 parsed = parse_one(sql)
-
-# Track aliases and sources
 alias_map = {}
-excluded_aliases = set()
-source_records = set()
+cte_names = set()
 
-def normalize_identifier(identifier):
-    return identifier.replace('"', '').replace('[', '').replace(']', '').lower()
 
-# Track all CTEs
-for cte in parsed.find_all(exp.CTE):
-    excluded_aliases.add(normalize_identifier(cte.alias_or_name))
+def process_ctes(expression):
+    """Extract CTEs recursively and register their names to skip them as real tables"""
+    for cte in expression.find_all(exp.CTE):
+        cte_name = cte.alias_or_name.lower()
+        cte_names.add(cte_name)
+        process_from_expression(cte.this, cte_name)  # Process body of the CTE
 
-# Recursively process all FROM/JOIN expressions
-def process_from_clause(expr):
+
+def process_from_expression(expr, parent_alias=None):
+    """Process subqueries, joins, and tables to build alias_map"""
     if isinstance(expr, exp.Subquery):
-        excluded_aliases.add(normalize_identifier(expr.alias_or_name))
-        # Also explore nested subqueries
-        for nested_from in expr.find_all(exp.From):
-            for source in nested_from.expressions:
-                process_from_clause(source)
+        alias = expr.alias_or_name
+        sub_select = expr.unnest()
+        visible_cols = []
+
+        for proj in sub_select.expressions:
+            if isinstance(proj, exp.Alias):
+                col_name = proj.alias
+                col_expr = proj.this
+            elif isinstance(proj, exp.Column):
+                col_name = proj.name
+                col_expr = proj
+            else:
+                continue
+
+            source_table = col_expr.table
+            if source_table in alias_map:
+                entries = alias_map[source_table]
+                if isinstance(entries, list):
+                    for c, db, schema, table in entries:
+                        if c == col_name.lower():
+                            visible_cols.append((col_name.lower(), db, schema, table))
+                            break
+                else:
+                    db, schema, table = entries
+                    visible_cols.append((col_name.lower(), db, schema, table))
+
+        alias_map[alias] = visible_cols
+        process_from_expression(sub_select)
 
     elif isinstance(expr, exp.Table):
-        alias = normalize_identifier(expr.alias_or_name)
-        table = normalize_identifier(expr.name)
-        if alias in excluded_aliases or table in excluded_aliases:
-            return
-        if isinstance(expr.parent, exp.Func):  # Skip table functions
-            return
+        alias = expr.alias_or_name
+        table = expr.name.lower()
+        schema = expr.args.get("db")
+        db = expr.args.get("catalog")
+        db = db.name.lower() if db else None
+        schema = schema.name.lower() if schema else None
 
-        db_expr = expr.args.get("catalog")
-        schema_expr = expr.args.get("db")
-        db = normalize_identifier(db_expr.name) if db_expr else None
-        schema = normalize_identifier(schema_expr.name) if schema_expr else None
+        if table in cte_names:
+            return  # Skip CTEs
 
-        # Infer from metadata
-        if db is None or schema is None:
-            matches = df_columns[df_columns["Table Name"] == table]
-            if not matches.empty:
-                if db is None and matches["Database Name"].nunique() == 1:
-                    db = matches.iloc[0]["Database Name"]
-                if schema is None and matches["Schema Name"].nunique() == 1:
-                    schema = matches.iloc[0]["Schema Name"]
+        # Try resolving from column reference if missing db/schema
+        matches = df_columns[df_columns["Table Name"] == table]
+        if not matches.empty:
+            if db is None and matches["Database Name"].nunique() == 1:
+                db = matches.iloc[0]["Database Name"]
+            if schema is None and matches["Schema Name"].nunique() == 1:
+                schema = matches.iloc[0]["Schema Name"]
 
         alias_map[alias] = (db, schema, table)
 
-# Collect all FROM and JOIN expressions
-for node in parsed.walk():
-    if isinstance(node, (exp.From, exp.Join)):
-        for expr in node.args.get("expressions", []):
-            process_from_clause(expr)
-        if isinstance(node, exp.Join):
-            process_from_clause(node.this)
+    # Process nested FROMs and JOINs
+    for child in expr.find_all(exp.From) + list(expr.find_all(exp.Join)):
+        for source in child.args.get("expressions", [child.this]):
+            process_from_expression(source)
 
-# Walk all columns, including wildcards
+
+# Process CTEs first
+process_ctes(parsed)
+
+# Process main FROM and JOINs
+for from_expr in parsed.find_all(exp.From):
+    for source in from_expr.args.get("expressions", []):
+        process_from_expression(source)
+
+for join_expr in parsed.find_all(exp.Join):
+    process_from_expression(join_expr.this)
+
+# Extract all column references
+records = set()
+
 for node in parsed.walk():
     if isinstance(node, exp.Column):
-        col = normalize_identifier(node.name)
-        alias = normalize_identifier(node.table) if node.table else None
-
-        if alias in excluded_aliases:
-            continue
+        col = node.name.strip().lower()
+        alias = node.table
 
         if alias and alias in alias_map:
-            db, schema, table = alias_map[alias]
-            source_records.add((db, schema, table, col))
+            entry = alias_map[alias]
+            if isinstance(entry, list):  # Subquery alias
+                for c, db, schema, table in entry:
+                    if c == col:
+                        records.add((db, schema, table, col))
+                        break
+            else:
+                db, schema, table = entry
+                records.add((db, schema, table, col))
         elif not alias:
+            # Unqualified column: check against df_columns
             matches = df_columns[df_columns["Column Name"] == col]
             for _, row in matches.iterrows():
-                source_records.add((
+                records.add((
                     row["Database Name"],
                     row["Schema Name"],
                     row["Table Name"],
                     row["Column Name"]
                 ))
 
-    elif isinstance(node, exp.Star):  # Expand wildcard (*)
-        alias = normalize_identifier(node.table) if node.table else None
-        if alias and alias in alias_map:
-            db, schema, table = alias_map[alias]
-            matches = df_columns[
-                (df_columns["Database Name"] == db) &
-                (df_columns["Schema Name"] == schema) &
-                (df_columns["Table Name"] == table)
-            ]
-            for _, row in matches.iterrows():
-                source_records.add((db, schema, table, row["Column Name"]))
-        elif not alias:  # Global wildcard
-            for _, row in df_columns.iterrows():
-                source_records.add((
-                    row["Database Name"],
-                    row["Schema Name"],
-                    row["Table Name"],
-                    row["Column Name"]
-                ))
-
-# Deduplicated result
-df_result = pd.DataFrame(sorted(source_records), columns=["Database", "Schema", "Table", "Column"])
+# Output
+df_result = pd.DataFrame(sorted(records), columns=["Database", "Schema", "Table", "Column"])
 print(df_result)
